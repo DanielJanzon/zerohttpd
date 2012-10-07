@@ -31,7 +31,7 @@ Performance can be measured with the httperf tool, i.e. by running
 
 
 Limits, bugs and known issues
------------------------------
+=============================
 
   (1) ZeroHTTP is only HTTP/1.1 compatible.
 
