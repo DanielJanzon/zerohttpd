@@ -100,10 +100,28 @@ int serve_file(struct client *client, const char *filename)
 
   struct stat sb;
   fstat(client->fd, &sb);
-  int n = write_header(client->read_event.sockfd, HTTP_200_OK, sb.st_size);
+  const char *head_fmt = "HTTP/1.1 %s\r\nContent-Length: %d\r\n\r\n";
+  char head[128];
+  int hdr_size = snprintf(head, sizeof(head), head_fmt, http_return_string[HTTP_200_OK], sb.st_size);
 
-  D(printf("serve_file: hdr sent (%d bytes), sending %d bytes of HTTP payload\n", n, (int)sb.st_size);)
-  int err = sendfile(client->fd, client->read_event.sockfd, 0, 0, NULL, &client->bytes_sent, 0);
+  struct iovec hdr_iovec[1];
+  hdr_iovec[0].iov_base = head;
+  hdr_iovec[0].iov_len = hdr_size;
+  struct sf_hdtr hdtr;
+  hdtr.headers = hdr_iovec;
+  hdtr.hdr_cnt = 1;
+  hdtr.trailers = NULL;
+  hdtr.trl_cnt = 0;
+
+  D(printf("serve_file: hdr (%d bytes), sending %d bytes of HTTP payload\n", n, (int)sb.st_size);)
+  int err = sendfile(client->fd, client->read_event.sockfd, 0, 0, &hdtr, &client->bytes_sent, 0);
+
+  if(!err && client->bytes_sent < hdr_size) {
+    #warning "BUG if not even header is sent in first streamfile"
+    printf("implement resend of header\n");
+  }
+  client->bytes_sent -= hdr_size; /* We just want to count the payload size */
+
   if(err < 0 && errno == EAGAIN) {
     D(printf("%d bytes were sent\n", (int)client->bytes_sent);)
     client->continue_event.callback = serve_file_continue;
