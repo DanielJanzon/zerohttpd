@@ -12,6 +12,7 @@
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <arpa/inet.h>
 #include <stdlib.h>
 #include <fcntl.h>
 #include <strings.h>
@@ -24,13 +25,19 @@
 #define D(x) 
 
 struct event; /* Forward declaration */
-typedef void (*event_callback)(int sockfd, struct event *ev);
+typedef void (*event_callback)(int sockfd, void *priv);
 
 struct event
 {
   struct kevent event;
   event_callback callback;
   int sockfd;
+  void *priv;
+};
+
+struct client
+{
+  struct event read_event;
   http_parser parser; /* Used to parse HTTP requests */
   http_parser_settings parser_settings;
   char url[1024];
@@ -60,26 +67,26 @@ int write_header(int socket, enum http_return_code return_code, int content_leng
   return m;
 }
 
-int serve_file(struct event *ev, const char *filename)
+int serve_file(struct client *client, const char *filename)
 {
   D(printf("serve_file: opening file '%s'\n", filename);)
-  ev->fd = open(filename, O_RDONLY);
-  if(ev->fd < 0)
+  client->fd = open(filename, O_RDONLY);
+  if(client->fd < 0)
   {
-    write_header(ev->sockfd, HTTP_404_NOT_FOUND, 0);
+    write_header(client->read_event.sockfd, HTTP_404_NOT_FOUND, 0);
     return 0; /* 404 is totally legitimate */
   }
 
   struct stat sb;
-  fstat(ev->fd, &sb);
-  write_header(ev->sockfd, HTTP_200_OK, sb.st_size);
+  fstat(client->fd, &sb);
+  int n = write_header(client->read_event.sockfd, HTTP_200_OK, sb.st_size);
 
-  D(printf("serve_file: hdr sent (%d bytes), sending %d bytes of HTTP payload\n", n, sb.st_size);)
+  D(printf("serve_file: hdr sent (%d bytes), sending %d bytes of HTTP payload\n", n, (int)sb.st_size);)
 
   #warning "BUG when sendfile doesn't send all data in one go"
-  sendfile(ev->fd, ev->sockfd, 0, 0, NULL, 0, 0);
+  sendfile(client->fd, client->read_event.sockfd, 0, 0, NULL, 0, 0);
 
-  close(ev->fd);
+  close(client->fd);
 
   return 0;
 }
@@ -87,24 +94,24 @@ int serve_file(struct event *ev, const char *filename)
 int zero_on_message_complete(http_parser *parser)
 {
   D(printf("got message complete on event %p\n", parser->data);)
-  struct event *ev = (struct event*)parser->data;
-  char *sp = ev->url;
+  struct client *client = (struct client*)parser->data;
+  char *sp = client->url;
   while(*sp == '/')
     sp++;
 
-  int err = serve_file(ev, sp);
+  int err = serve_file(client, sp);
   rate_counter_counter++;
   return err; /* Hopefully tell parser all went ok */
 }
 
 int zero_on_url(http_parser *parser, const char *at, size_t length)
 {
-  struct event *ev = (struct event*)parser->data;
+  struct client *client = (struct client*)parser->data;
   D(printf("zero_on_url: got length %d\n", length);)
   length = (length < 1023) ? length : 1023;
-  memcpy(ev->url, at, length);
-  ev->url[length] = '\0';
-  D(printf("got url '%s' on event %p\n", ev->url, ev);)
+  memcpy(client->url, at, length);
+  client->url[length] = '\0';
+  D(printf("got url '%s' on client %p\n", client->url, client);)
 
   return 0; /* Tell parser all went ok */
 }
@@ -140,30 +147,32 @@ static inline void set_no_tcp_delay(int fd)
   }
 }
 
-void client_read(int sockfd, struct event *ev)
+void client_read(int sockfd, void *priv)
 {
   char buf[cfg.client_buf_size];
+
+  struct client *client = priv;
 
   int n = read(sockfd, buf, cfg.client_buf_size);
   D(printf("client_read: read %d bytes\n", n);)
   if(n==0)
   {
-    D(printf("client_read: releasing event %p\n", ev);)
+    D(printf("client_read: releasing client %p\n", client);)
     close(sockfd);
-    free(ev);
+    free(client);
     return;
   }
 
-  int nparsed = http_parser_execute(&ev->parser, &ev->parser_settings, buf, n);
+  int nparsed = http_parser_execute(&client->parser, &client->parser_settings, buf, n);
   if(nparsed != n)
   {
     D(printf("parser failed (parsed %d bytes)\n", nparsed);)
     close(sockfd); /* Automatically deletes kqueue events */
-    free(ev);
+    free(client);
   }
 }
 
-void new_con_cb(int sockfd, struct event *not_used)
+void new_con_cb(int sockfd, void *not_used)
 {
   D(printf("received new con with socket %d\n", sockfd);)
 
@@ -179,20 +188,21 @@ void new_con_cb(int sockfd, struct event *not_used)
     set_nonblocking(accepted_sockfd);
     set_no_tcp_delay(accepted_sockfd);
 
-    struct event *ev = (struct event*)malloc(sizeof(struct event));
-    bzero(ev, sizeof(struct event));
-    ev->sockfd = accepted_sockfd;
-    ev->callback = client_read;
+    struct client *client = (struct client*)malloc(sizeof(struct client));
+    bzero(client, sizeof(struct client));
+    client->read_event.sockfd = accepted_sockfd;
+    client->read_event.callback = client_read;
+    client->read_event.priv = client;
 
     /* Initialize HTTP parser for this client */
-    http_parser_init(&ev->parser, HTTP_REQUEST);
+    http_parser_init(&client->parser, HTTP_REQUEST);
   
-    ev->parser_settings.on_url = zero_on_url;
-    ev->parser_settings.on_message_complete = zero_on_message_complete;
-    ev->parser.data = ev;
+    client->parser_settings.on_url = zero_on_url;
+    client->parser_settings.on_message_complete = zero_on_message_complete;
+    client->parser.data = client;
 
-    EV_SET(&ev->event, accepted_sockfd, EVFILT_READ, EV_ADD, 0, 0, ev);
-    kevent(kevent_base, &ev->event, 1, (void*)0, 0, NULL);
+    EV_SET(&client->read_event.event, accepted_sockfd, EVFILT_READ, EV_ADD, 0, 0, client);
+    kevent(kevent_base, &client->read_event.event, 1, (void*)0, 0, NULL);
   }
   if(errno != EAGAIN)
   {
@@ -222,6 +232,7 @@ int create_listen_socket()
 
   new_con_ev.sockfd = sockfd;
   new_con_ev.callback = new_con_cb;
+  new_con_ev.priv = NULL;
 
   /* Add listen socket to kqueue */
   EV_SET(&new_con_ev.event, sockfd, EVFILT_READ, EV_ADD, 0, 0, &new_con_ev);
@@ -230,7 +241,7 @@ int create_listen_socket()
   return 0;
 }
 
-void rate_counter_print(int socket, struct event *ev)
+void rate_counter_print(int socket, void *not_used)
 {
   printf("%d req/s\n", rate_counter_counter);
   rate_counter_counter = 0;
@@ -239,6 +250,7 @@ void rate_counter_print(int socket, struct event *ev)
 void rate_counter_init()
 {
   rate_counter_event.callback = rate_counter_print;
+  rate_counter_event.priv = NULL;
   EV_SET(&rate_counter_event.event, 0, EVFILT_TIMER, EV_ADD, 0, 1000, &rate_counter_event);
   kevent(kevent_base, &rate_counter_event.event, 1, (void*)0, 0, NULL);
 }
@@ -256,7 +268,7 @@ void event_loop()
     for(i=0; i<num_events; i++)
     {
       struct event *ev = (struct event*)events[i].udata;
-      ev->callback(events[i].ident, ev);
+      ev->callback(events[i].ident, ev->priv);
       if(events[i].flags & EV_EOF)
       {
         D(printf("got EOF!\n");)
