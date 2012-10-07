@@ -38,10 +38,12 @@ struct event
 struct client
 {
   struct event read_event;
+  struct event continue_event;
   http_parser parser; /* Used to parse HTTP requests */
   http_parser_settings parser_settings;
   char url[1024];
   int fd; /* File that we are currently streaming */
+  off_t bytes_sent;
 };
 
 /*
@@ -67,6 +69,25 @@ int write_header(int socket, enum http_return_code return_code, int content_leng
   return m;
 }
 
+void serve_file_continue(int socket, void *arg)
+{
+  struct client *client = arg;
+
+  D(printf("continue streaming on client %p\n", client);)
+  off_t sbytes;
+  int err = sendfile(client->fd, socket, client->bytes_sent, 0, NULL, &sbytes, 0);
+  client->bytes_sent  += sbytes; 
+  if(err < 0 && errno == EAGAIN) {
+    D(printf("%d bytes were sent\n", (int)sbytes);)
+    EV_SET(&client->continue_event.event, client->continue_event.sockfd, EVFILT_WRITE, EV_ADD|EV_ONESHOT, 0, 0, &client->continue_event);
+    kevent(kevent_base, &client->continue_event.event, 1, (void*)0, 0, NULL);
+  }
+  else {
+    D(printf("closing client %p\n", client);)
+    close(client->fd);
+  }
+}
+
 int serve_file(struct client *client, const char *filename)
 {
   D(printf("serve_file: opening file '%s'\n", filename);)
@@ -82,11 +103,20 @@ int serve_file(struct client *client, const char *filename)
   int n = write_header(client->read_event.sockfd, HTTP_200_OK, sb.st_size);
 
   D(printf("serve_file: hdr sent (%d bytes), sending %d bytes of HTTP payload\n", n, (int)sb.st_size);)
-
-  #warning "BUG when sendfile doesn't send all data in one go"
-  sendfile(client->fd, client->read_event.sockfd, 0, 0, NULL, 0, 0);
-
-  close(client->fd);
+  int err = sendfile(client->fd, client->read_event.sockfd, 0, 0, NULL, &client->bytes_sent, 0);
+  if(err < 0 && errno == EAGAIN) {
+    D(printf("%d bytes were sent\n", (int)client->bytes_sent);)
+    client->continue_event.callback = serve_file_continue;
+    client->continue_event.priv = client;
+    client->continue_event.sockfd = client->read_event.sockfd; /* This line is crucial for the event to occur */
+    EV_SET(&client->continue_event.event, client->continue_event.sockfd, EVFILT_WRITE, EV_ADD|EV_ONESHOT, 0, 0, &client->continue_event);
+    kevent(kevent_base, &client->continue_event.event, 1, (void*)0, 0, NULL);
+    #warning "BUG Turn off read events until finished streaming?"
+  }
+  else {
+    D(printf("closing client %p\n", client);)
+    close(client->fd);
+  }
 
   return 0;
 }
@@ -201,7 +231,7 @@ void new_con_cb(int sockfd, void *not_used)
     client->parser_settings.on_message_complete = zero_on_message_complete;
     client->parser.data = client;
 
-    EV_SET(&client->read_event.event, accepted_sockfd, EVFILT_READ, EV_ADD, 0, 0, client);
+    EV_SET(&client->read_event.event, accepted_sockfd, EVFILT_READ, EV_ADD, 0, 0, &client->read_event);
     kevent(kevent_base, &client->read_event.event, 1, (void*)0, 0, NULL);
   }
   if(errno != EAGAIN)
