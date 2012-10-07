@@ -76,6 +76,8 @@ int serve_file(struct event *ev, const char *filename)
   #warning "BUG when sendfile doesn't send all data in one go"
   sendfile(ev->fd, ev->sockfd, 0, 0, NULL, 0, 0);
 
+  close(ev->fd);
+
   return 0;
 }
 
