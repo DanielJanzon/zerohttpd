@@ -23,6 +23,8 @@ ZeroHTTP achieves high performance by
 
   (5) Use somebody else's fast HTTP parser
 
+  (6) [Not implemented] Cache file descriptors in order to save
+      open/fstat/close cycle.
 
 Performance can be measured with the httperf tool, i.e. by running
 
