@@ -43,6 +43,9 @@ struct event
  */
 int kevent_base = -1;
 
+struct event rate_counter_event;
+static int rate_counter_counter = 0;
+
 enum http_return_code {HTTP_200_OK = 0, HTTP_404_NOT_FOUND};
 const char * http_return_string[] = {"200 OK", "404 Not Found"};
 
@@ -90,6 +93,7 @@ int zero_on_message_complete(http_parser *parser)
     sp++;
 
   int err = serve_file(ev, sp);
+  rate_counter_counter++;
   return err; /* Hopefully tell parser all went ok */
 }
 
@@ -226,6 +230,19 @@ int create_listen_socket()
   return 0;
 }
 
+void rate_counter_print(int socket, struct event *ev)
+{
+  printf("%d req/s\n", rate_counter_counter);
+  rate_counter_counter = 0;
+}
+
+void rate_counter_init()
+{
+  rate_counter_event.callback = rate_counter_print;
+  EV_SET(&rate_counter_event.event, 0, EVFILT_TIMER, EV_ADD, 0, 1000, &rate_counter_event);
+  kevent(kevent_base, &rate_counter_event.event, 1, (void*)0, 0, NULL);
+}
+
 void event_loop()
 {
   while(1)
@@ -256,5 +273,6 @@ int main()
 
   kevent_base = kqueue();
   create_listen_socket();
+  rate_counter_init();
   event_loop();
 }
