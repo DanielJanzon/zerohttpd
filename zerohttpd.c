@@ -7,8 +7,8 @@
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <sys/event.h>
 #include <sys/stat.h>
+#include <sys/sendfile.h>
 #include <sys/uio.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -20,20 +20,14 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <event.h>
+
 #include "http-parser/http_parser.h"
 
-#define D(x) 
+#define D(x)
 
 struct event; /* Forward declaration */
 typedef void (*event_callback)(int sockfd, void *priv);
-
-struct event
-{
-  struct kevent event;
-  event_callback callback;
-  int sockfd;
-  void *priv;
-};
 
 struct client
 {
@@ -44,13 +38,10 @@ struct client
   char url[1024];
   int fd; /* File that we are currently streaming */
   off_t bytes_sent;
+  int file_size;
+  int sockfd;
 };
 
-/*
- * This is the descriptor for the event set we will
- * be watching in the event loop.
- */
-int kevent_base = -1;
 
 struct event rate_counter_event;
 static int rate_counter_counter = 0;
@@ -69,20 +60,31 @@ int write_header(int socket, enum http_return_code return_code, int content_leng
   return m;
 }
 
-void serve_file_continue(int socket, void *arg)
+void serve_file_continue(int sockfd, short what, void *arg)
 {
   struct client *client = arg;
 
   D(printf("continue streaming on client %p\n", client);)
-  off_t sbytes;
-  int err = sendfile(client->fd, socket, client->bytes_sent, 0, NULL, &sbytes, 0);
-  client->bytes_sent  += sbytes; 
-  if(err < 0 && errno == EAGAIN) {
-    D(printf("%d bytes were sent\n", (int)sbytes);)
-    EV_SET(&client->continue_event.event, client->continue_event.sockfd, EVFILT_WRITE, EV_ADD|EV_ONESHOT, 0, 0, &client->continue_event);
-    kevent(kevent_base, &client->continue_event.event, 1, (void*)0, 0, NULL);
+  int bytes_to_send =  client->file_size - client->bytes_sent;
+
+  int n = sendfile(sockfd, client->fd, 0, bytes_to_send);
+
+  if (n < 0 && errno != EAGAIN)
+  {
+    D(printf("closing client %p\n", client);)
+    close(client->fd);
+    return;
   }
-  else {
+
+  if( (n < 0 && errno == EAGAIN) || n < bytes_to_send) {
+    D(printf("%d bytes were sent\n", (int)n);)
+    #warning "Need to call event_set again?"
+    event_set(&client->continue_event, client->sockfd, EV_WRITE, serve_file_continue, client);
+    client->bytes_sent += n;
+    event_add(&client->continue_event, NULL);
+  }
+  else
+  {
     D(printf("closing client %p\n", client);)
     close(client->fd);
   }
@@ -94,47 +96,23 @@ int serve_file(struct client *client, const char *filename)
   client->fd = open(filename, O_RDONLY);
   if(client->fd < 0)
   {
-    write_header(client->read_event.sockfd, HTTP_404_NOT_FOUND, 0);
+    write_header(client->sockfd, HTTP_404_NOT_FOUND, 0);
     return 0; /* 404 is totally legitimate */
   }
 
   struct stat sb;
   fstat(client->fd, &sb);
+  client->file_size = sb.st_size;
   const char *head_fmt = "HTTP/1.1 %s\r\nContent-Length: %d\r\n\r\n";
   char head[128];
-  int hdr_size = snprintf(head, sizeof(head), head_fmt, http_return_string[HTTP_200_OK], sb.st_size);
+  int hdr_size = snprintf(head, sizeof(head), head_fmt, http_return_string[HTTP_200_OK], client->file_size);
 
-  struct iovec hdr_iovec[1];
-  hdr_iovec[0].iov_base = head;
-  hdr_iovec[0].iov_len = hdr_size;
-  struct sf_hdtr hdtr;
-  hdtr.headers = hdr_iovec;
-  hdtr.hdr_cnt = 1;
-  hdtr.trailers = NULL;
-  hdtr.trl_cnt = 0;
-
-  D(printf("serve_file: hdr (%d bytes), sending %d bytes of HTTP payload\n", n, (int)sb.st_size);)
-  int err = sendfile(client->fd, client->read_event.sockfd, 0, 0, &hdtr, &client->bytes_sent, 0);
-
-  if(!err && client->bytes_sent < hdr_size) {
-    #warning "BUG if not even header is sent in first streamfile"
-    printf("implement resend of header\n");
+  if (write(client->sockfd, head, hdr_size) < hdr_size)
+  {
+      printf("oh dear!\n");
   }
-  client->bytes_sent -= hdr_size; /* We just want to count the payload size */
 
-  if(err < 0 && errno == EAGAIN) {
-    D(printf("%d bytes were sent\n", (int)client->bytes_sent);)
-    client->continue_event.callback = serve_file_continue;
-    client->continue_event.priv = client;
-    client->continue_event.sockfd = client->read_event.sockfd; /* This line is crucial for the event to occur */
-    EV_SET(&client->continue_event.event, client->continue_event.sockfd, EVFILT_WRITE, EV_ADD|EV_ONESHOT, 0, 0, &client->continue_event);
-    kevent(kevent_base, &client->continue_event.event, 1, (void*)0, 0, NULL);
-    #warning "BUG Turn off read events until finished streaming?"
-  }
-  else {
-    D(printf("closing client %p\n", client);)
-    close(client->fd);
-  }
+  serve_file_continue(client->sockfd, EV_WRITE, client);
 
   return 0;
 }
@@ -155,7 +133,7 @@ int zero_on_message_complete(http_parser *parser)
 int zero_on_url(http_parser *parser, const char *at, size_t length)
 {
   struct client *client = (struct client*)parser->data;
-  D(printf("zero_on_url: got length %d\n", length);)
+  D(printf("zero_on_url: got length %d\n", (int)length);)
   length = (length < 1023) ? length : 1023;
   memcpy(client->url, at, length);
   client->url[length] = '\0';
@@ -181,7 +159,6 @@ static inline void set_nonblocking(int fd)
   int flags = fcntl(fd, F_GETFL, 0);
   flags |= O_NONBLOCK;
   fcntl(fd, F_SETFL, O_NONBLOCK);
-
 }
 
 static inline void set_no_tcp_delay(int fd)
@@ -195,7 +172,7 @@ static inline void set_no_tcp_delay(int fd)
   }
 }
 
-void client_read(int sockfd, void *priv)
+void client_read(int sockfd, short what, void *priv)
 {
   char buf[cfg.client_buf_size];
 
@@ -207,6 +184,7 @@ void client_read(int sockfd, void *priv)
   {
     D(printf("client_read: releasing client %p\n", client);)
     close(sockfd);
+    event_del(&client->read_event);
     free(client);
     return;
   }
@@ -220,12 +198,12 @@ void client_read(int sockfd, void *priv)
   }
 }
 
-void new_con_cb(int sockfd, void *not_used)
+void new_con_cb(int sockfd, short what, void *not_used)
 {
   D(printf("received new con with socket %d\n", sockfd);)
 
   struct sockaddr_in saddr;
-  bzero(&saddr, sizeof(struct sockaddr_in));
+  memset(&saddr, 0, sizeof(struct sockaddr_in));
   socklen_t addr_len = (socklen_t)sizeof(struct sockaddr_in);
   int accepted_sockfd;
 
@@ -237,10 +215,9 @@ void new_con_cb(int sockfd, void *not_used)
     set_no_tcp_delay(accepted_sockfd);
 
     struct client *client = (struct client*)malloc(sizeof(struct client));
-    bzero(client, sizeof(struct client));
-    client->read_event.sockfd = accepted_sockfd;
-    client->read_event.callback = client_read;
-    client->read_event.priv = client;
+    memset(client, 0, sizeof(struct client));
+
+    event_set(&client->read_event, accepted_sockfd, EV_READ|EV_PERSIST, client_read, client);
 
     /* Initialize HTTP parser for this client */
     http_parser_init(&client->parser, HTTP_REQUEST);
@@ -248,9 +225,9 @@ void new_con_cb(int sockfd, void *not_used)
     client->parser_settings.on_url = zero_on_url;
     client->parser_settings.on_message_complete = zero_on_message_complete;
     client->parser.data = client;
+    client->sockfd = accepted_sockfd;
 
-    EV_SET(&client->read_event.event, accepted_sockfd, EVFILT_READ, EV_ADD, 0, 0, &client->read_event);
-    kevent(kevent_base, &client->read_event.event, 1, (void*)0, 0, NULL);
+    event_add(&client->read_event, NULL);
   }
   if(errno != EAGAIN)
   {
@@ -261,7 +238,7 @@ void new_con_cb(int sockfd, void *not_used)
 
 int create_listen_socket()
 {
-  int sockfd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
   struct sockaddr_in saddr;
   bzero(&saddr, sizeof(struct sockaddr_in));
   saddr.sin_family = PF_INET;
@@ -278,51 +255,30 @@ int create_listen_socket()
 
   set_nonblocking(sockfd);
 
-  new_con_ev.sockfd = sockfd;
-  new_con_ev.callback = new_con_cb;
-  new_con_ev.priv = NULL;
-
-  /* Add listen socket to kqueue */
-  EV_SET(&new_con_ev.event, sockfd, EVFILT_READ, EV_ADD, 0, 0, &new_con_ev);
-  kevent(kevent_base, &new_con_ev.event, 1, (void*)0, 0, NULL);
+  event_set(&new_con_ev, sockfd, EV_READ|EV_PERSIST, new_con_cb, NULL);
+  event_add(&new_con_ev, NULL);
 
   return 0;
 }
 
-void rate_counter_print(int socket, void *not_used)
+void rate_counter_print(int socket, short what, void *not_used)
 {
   printf("%d req/s\n", rate_counter_counter);
   rate_counter_counter = 0;
+
+  struct timeval tv;
+  tv.tv_sec = 1;
+  tv.tv_usec = 0;
+  evtimer_add(&rate_counter_event, &tv);
 }
 
 void rate_counter_init()
 {
-  rate_counter_event.callback = rate_counter_print;
-  rate_counter_event.priv = NULL;
-  EV_SET(&rate_counter_event.event, 0, EVFILT_TIMER, EV_ADD, 0, 1000, &rate_counter_event);
-  kevent(kevent_base, &rate_counter_event.event, 1, (void*)0, 0, NULL);
-}
-
-void event_loop()
-{
-  while(1)
-  {
-    struct kevent events[100];
-    int num_events = kevent(kevent_base, (void*)0, 0, events, 100, NULL);
-    if(num_events == -1)
-      printf("kevent error: %s\n", strerror(errno));
-
-    int i;
-    for(i=0; i<num_events; i++)
-    {
-      struct event *ev = (struct event*)events[i].udata;
-      ev->callback(events[i].ident, ev->priv);
-      if(events[i].flags & EV_EOF)
-      {
-        D(printf("got EOF!\n");)
-      }
-    }
-  }
+  struct timeval tv;
+  tv.tv_sec = 1;
+  tv.tv_usec = 0;
+  evtimer_set(&rate_counter_event, rate_counter_print, NULL);
+  evtimer_add(&rate_counter_event, &tv);
 }
 
 int main()
@@ -331,8 +287,8 @@ int main()
   cfg.max_pending = 5;
   cfg.client_buf_size = 1024;
 
-  kevent_base = kqueue();
+  event_init();
   create_listen_socket();
   rate_counter_init();
-  event_loop();
+  event_dispatch();
 }
