@@ -80,7 +80,10 @@ void serve_file_continue(int sockfd, short what, void *arg)
     D(printf("%d bytes were sent\n", (int)n);)
     #warning "Need to call event_set again?"
     event_set(&client->continue_event, client->sockfd, EV_WRITE, serve_file_continue, client);
-    client->bytes_sent += n;
+    if (n > 0)
+    {
+      client->bytes_sent += n;
+    }
     event_add(&client->continue_event, NULL);
   }
   else
