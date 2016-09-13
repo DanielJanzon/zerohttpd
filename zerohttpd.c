@@ -67,12 +67,23 @@ void serve_file_continue(int sockfd, short what, void *arg)
   D(printf("continue streaming on client %p\n", client);)
   int bytes_to_send =  client->file_size - client->bytes_sent;
 
-  int n = sendfile(sockfd, client->fd, 0, bytes_to_send);
+  char buf[8*1024];
+  int m = read(client->fd, buf, sizeof buf);
+
+  if (m < 0)
+  {
+    printf("shit pommes frites (%m)\n");
+    exit(1);
+  }
+
+  int n = write(sockfd, buf, m);
 
   if (n < 0 && errno != EAGAIN)
   {
     D(printf("closing client %p\n", client);)
+    printf("scheisse (%m)\n");
     close(client->fd);
+    exit(1);
     return;
   }
 
@@ -80,13 +91,17 @@ void serve_file_continue(int sockfd, short what, void *arg)
     D(printf("%d bytes were sent\n", (int)n);)
     #warning "Need to call event_set again?"
     event_set(&client->continue_event, client->sockfd, EV_WRITE, serve_file_continue, client);
-    client->bytes_sent += n;
     event_add(&client->continue_event, NULL);
   }
   else
   {
     D(printf("closing client %p\n", client);)
     close(client->fd);
+  }
+
+  if (n >= 0)
+  {
+    client->bytes_sent += n;
   }
 }
 
